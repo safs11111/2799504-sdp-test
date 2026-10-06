@@ -1,5 +1,7 @@
-export type RepoStatus = "pending" | "analyzing" | "ready" | "failed";
-export type RepoSourceType = "url" | "path";
+export type RepoStatus = "pending" | "cloning" | "extracting" | "analyzing" | "indexing" | "ready" | "failed";
+export type RepoSourceType = "url" | "path" | "zip";
+export type JobStatus = "queued" | "running" | "done" | "failed";
+export type JobStage = "queued" | "cloning" | "extracting" | "parsing" | "indexing" | "done" | "failed";
 
 export type Repository = {
   id: number;
@@ -10,8 +12,23 @@ export type Repository = {
   status: RepoStatus;
   errorMessage: string | null;
   commitCount: number;
+  progress: number;
+  currentStage: string;
   createdAt: number;
   updatedAt: number;
+};
+
+export type IngestJob = {
+  id: number;
+  repositoryId: number;
+  status: JobStatus;
+  stage: JobStage;
+  progress: number;
+  message: string;
+  errorMessage: string | null;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
 };
 
 export type Author = {
@@ -20,6 +37,7 @@ export type Author = {
   name: string;
   email: string;
   displayName: string;
+  commitCount: number;
 };
 
 export type CommitRecord = {
@@ -27,6 +45,8 @@ export type CommitRecord = {
   sha: string;
   parentSha: string | null;
   authorId: number;
+  rawAuthorName: string;
+  rawAuthorEmail: string;
   committerDate: number;
   subject: string;
   ordinal: number;
@@ -56,6 +76,15 @@ export type MetricFilters = {
 };
 
 export type ObjectKind = "file" | "dir";
+export type SortField = "path" | "added" | "removed" | "growth" | "churn" | "modifications" | "modificationFrequency" | "churnRate";
+export type SortDirection = "asc" | "desc";
+
+export type Pagination = {
+  limit: number;
+  offset: number;
+  sortBy: SortField;
+  sortDir: SortDirection;
+};
 
 export type MetricRow = {
   path: string;
@@ -78,10 +107,28 @@ export type AuthorMetricRow = {
   ownership: number;
 };
 
+export type CommitListRow = {
+  sha: string;
+  authorId: number;
+  authorName: string;
+  authorEmail: string;
+  committerDate: number;
+  subject: string;
+  ordinal: number;
+};
+
 export type MetricsResult = {
   denominatorCommits: number;
   summary: MetricRow;
   files: MetricRow[];
   directories: MetricRow[];
   authors: AuthorMetricRow[];
+  fileTotal: number;
+  directoryTotal: number;
+  page: {
+    limit: number;
+    offset: number;
+    sortBy: SortField;
+    sortDir: SortDirection;
+  };
 };

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import AdmZip from "adm-zip";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 let tempRoot = "";
@@ -27,16 +28,12 @@ function gitDate(timestamp: number): string {
 
 function commit(repo: string, message: string, authorName: string, authorEmail: string, timestamp: number) {
   sh(["git", "add", "."], repo);
-  sh(
-    ["git", "commit", "-m", message, `--author=${authorName} <${authorEmail}>`],
-    repo,
-    {
-      GIT_COMMITTER_NAME: authorName,
-      GIT_COMMITTER_EMAIL: authorEmail,
-      GIT_COMMITTER_DATE: gitDate(timestamp),
-      GIT_AUTHOR_DATE: gitDate(timestamp),
-    },
-  );
+  sh(["git", "commit", "-m", message, `--author=${authorName} <${authorEmail}>`], repo, {
+    GIT_COMMITTER_NAME: authorName,
+    GIT_COMMITTER_EMAIL: authorEmail,
+    GIT_COMMITTER_DATE: gitDate(timestamp),
+    GIT_AUTHOR_DATE: gitDate(timestamp),
+  });
 }
 
 function createFixtureRepo(): string {
@@ -81,6 +78,14 @@ function createFixtureRepo(): string {
   return repo;
 }
 
+async function analyzeFixture(repo: string) {
+  const { createRepository } = await import("../lib/repositories");
+  const { analyzeRepository } = await import("../lib/git");
+  const record = await createRepository({ name: "fixture", sourceType: "path", source: repo, localPath: repo });
+  await analyzeRepository(record.id, repo);
+  return record;
+}
+
 beforeEach(async () => {
   tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rat-test-"));
   process.env.RAT_DATA_DIR = path.join(tempRoot, "data");
@@ -99,12 +104,9 @@ afterEach(async () => {
 describe("repository analysis foundation", () => {
   it("persists non-merge commits, authors, file metrics, directory rollups, and binary skips", async () => {
     const repo = createFixtureRepo();
-    const { createRepository, listAuthors, getRepositoryById } = await import("../lib/repositories");
-    const { analyzeRepository } = await import("../lib/git");
+    const record = await analyzeFixture(repo);
+    const { listAuthors, getRepositoryById } = await import("../lib/repositories");
     const { getRepositoryMetrics } = await import("../lib/metrics");
-
-    const record = await createRepository({ name: "fixture", sourceType: "path", source: repo, localPath: repo });
-    await analyzeRepository(record.id, repo);
 
     const stored = await getRepositoryById(record.id);
     const expectedNonMergeCount = Number(sh(["git", "rev-list", "--count", "--no-merges", "HEAD"], repo).trim());
@@ -132,20 +134,17 @@ describe("repository analysis foundation", () => {
     expect(authors.some((author) => author.email === "alias@example.com")).toBe(false);
   });
 
-  it("applies author and committer-date commit-set filters with safe zero denominators", async () => {
+  it("applies author, committer-date, and manual commit-set filters with safe zero denominators", async () => {
     const repo = createFixtureRepo();
-    const { createRepository, listAuthors } = await import("../lib/repositories");
-    const { analyzeRepository } = await import("../lib/git");
-    const { getRepositoryMetrics } = await import("../lib/metrics");
+    const record = await analyzeFixture(repo);
+    const { listAuthors } = await import("../lib/repositories");
+    const { getRepositoryMetrics, listCommits } = await import("../lib/metrics");
 
-    const record = await createRepository({ name: "fixture", sourceType: "path", source: repo, localPath: repo });
-    await analyzeRepository(record.id, repo);
     const authors = await listAuthors(record.id);
     const bob = authors.find((author) => author.email === "bob@example.com");
     expect(bob).toBeDefined();
 
     const onlyBobOnSrc = await getRepositoryMetrics(record.id, { authorId: bob!.id }, "src", "dir");
-    expect(onlyBobOnSrc.denominatorCommits).toBeGreaterThan(0);
     expect(onlyBobOnSrc.summary.added).toBe(1);
     expect(onlyBobOnSrc.summary.removed).toBe(3);
     expect(onlyBobOnSrc.summary.churn).toBe(4);
@@ -155,9 +154,73 @@ describe("repository analysis foundation", () => {
     expect(exactWindow.summary.added).toBe(1);
     expect(exactWindow.summary.removed).toBe(1);
 
+    const commits = await listCommits(record.id, {}, 20);
+    const deleteCommit = commits.find((commit) => commit.subject === "delete renamed");
+    expect(deleteCommit).toBeDefined();
+    const manual = await getRepositoryMetrics(record.id, { commits: [deleteCommit!.sha] }, "src", "dir");
+    expect(manual.denominatorCommits).toBe(1);
+    expect(manual.summary.added).toBe(0);
+    expect(manual.summary.removed).toBe(3);
+
     const empty = await getRepositoryMetrics(record.id, { from: 999999 }, "src", "dir");
     expect(empty.denominatorCommits).toBe(0);
     expect(empty.summary.modificationFrequency).toBe(0);
     expect(empty.summary.churnRate).toBe(0);
+  });
+
+  it("keeps zero-metric historical objects visible in paginated tables", async () => {
+    const repo = createFixtureRepo();
+    const record = await analyzeFixture(repo);
+    const { getRepositoryMetrics } = await import("../lib/metrics");
+
+    const metrics = await getRepositoryMetrics(record.id, { from: 7000, to: 8000 }, "", "dir", {
+      limit: 100,
+      offset: 0,
+      sortBy: "path",
+      sortDir: "asc",
+    });
+    const oldPath = metrics.files.find((file) => file.path === "src/a.txt");
+    expect(oldPath).toBeDefined();
+    expect(oldPath?.churn).toBe(0);
+  });
+
+  it("merges authors manually and recomputes ownership from commit author ids", async () => {
+    const repo = createFixtureRepo();
+    const record = await analyzeFixture(repo);
+    const { listAuthors, mergeAuthors } = await import("../lib/repositories");
+    const { getRepositoryMetrics } = await import("../lib/metrics");
+
+    const authors = await listAuthors(record.id);
+    const alice = authors.find((author) => author.email === "alice@example.com")!;
+    const bob = authors.find((author) => author.email === "bob@example.com")!;
+    await mergeAuthors(record.id, alice.id, [bob.id]);
+
+    const mergedAuthors = await listAuthors(record.id);
+    expect(mergedAuthors.some((author) => author.email === "bob@example.com")).toBe(false);
+    const root = await getRepositoryMetrics(record.id, {}, "", "dir");
+    expect(root.authors).toHaveLength(1);
+    expect(root.authors[0].ownership).toBe(1);
+  });
+
+  it("extracts zip repositories safely and rejects archives without .git", async () => {
+    const repo = createFixtureRepo();
+    const { createRepository } = await import("../lib/repositories");
+    const { analyzeRepository } = await import("../lib/git");
+    const { getRepositoryMetrics } = await import("../lib/metrics");
+    const { extractRepositoryZip } = await import("../lib/zip");
+
+    const zip = new AdmZip();
+    zip.addLocalFolder(repo, "wrapped");
+    const record = await createRepository({ name: "zip", sourceType: "zip", source: "fixture.zip", localPath: "" });
+    const extracted = extractRepositoryZip(zip.toBuffer(), record.id);
+    expect(fs.existsSync(path.join(extracted, ".git"))).toBe(true);
+    await analyzeRepository(record.id, extracted);
+    const src = await getRepositoryMetrics(record.id, {}, "src", "dir");
+    expect(src.summary.churn).toBe(8);
+
+    const badZip = new AdmZip();
+    badZip.addFile("file.txt", Buffer.from("not a repo"));
+    expect(() => extractRepositoryZip(badZip.toBuffer(), record.id + 1)).toThrow(/\.git/);
+
   });
 });

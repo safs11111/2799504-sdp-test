@@ -3,16 +3,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { openDatabase, transaction } from "./db";
 import { repositoriesDir } from "./paths";
-import { findOrCreateAuthor, replaceRepositoryAnalysis, updateRepositoryStatus } from "./repositories";
-import type { CommitRecord, DirMetric, FileChange } from "./types";
+import { findOrCreateAuthor, replaceRepositoryAnalysis, updateRepositoryProgress, updateRepositoryStatus } from "./repositories";
+import type { CommitRecord, DirMetric, FileChange, JobStage } from "./types";
 
 type ParsedCommit = {
   sha: string;
   parentSha: string | null;
   authorName: string;
   authorEmail: string;
+  rawAuthorName: string;
+  rawAuthorEmail: string;
   committerDate: number;
   subject: string;
+  changes: ParsedChange[];
 };
 
 type ParsedChange = {
@@ -21,22 +24,36 @@ type ParsedChange = {
   removed: number;
 };
 
-function git(args: string[], cwd?: string): string {
+export type AnalysisProgress = (stage: JobStage, progress: number, message: string) => Promise<void> | void;
+
+function git(args: string[], cwd?: string, encoding: BufferEncoding = "utf8"): string {
   return execFileSync("git", args, {
     cwd,
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 256,
+    encoding,
+    maxBuffer: 1024 * 1024 * 512,
     stdio: ["ignore", "pipe", "pipe"],
-  });
+  }) as string;
+}
+
+export function ensureGitAvailable(): void {
+  try {
+    git(["--version"]);
+  } catch {
+    throw new Error("git is not installed or is not available on PATH");
+  }
 }
 
 export function ensureGitRepository(repoPath: string): void {
+  ensureGitAvailable();
   if (!fs.existsSync(repoPath)) throw new Error(`Path does not exist: ${repoPath}`);
   const inside = git(["rev-parse", "--is-inside-work-tree"], repoPath).trim();
   if (inside !== "true") throw new Error(`Path is not a git work tree: ${repoPath}`);
+  const gitPath = path.join(repoPath, ".git");
+  if (!fs.existsSync(gitPath)) throw new Error(`Repository must include a .git file or directory: ${repoPath}`);
 }
 
 export function cloneRepository(url: string, repositoryId: number): string {
+  ensureGitAvailable();
   fs.mkdirSync(repositoriesDir(), { recursive: true });
   const target = path.join(repositoriesDir(), String(repositoryId));
   if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
@@ -44,58 +61,88 @@ export function cloneRepository(url: string, repositoryId: number): string {
   return target;
 }
 
-function parseCommits(repoPath: string): ParsedCommit[] {
-  const output = git(["log", "--no-merges", "--reverse", "--format=%H%x00%P%x00%aN%x00%aE%x00%ct%x00%s%x1e", "HEAD"], repoPath);
-  return output
-    .split("\x1e")
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .map((entry) => {
-      const [sha, parents, authorName, authorEmail, ts, ...subjectParts] = entry.split("\x00");
-      return {
-        sha,
-        parentSha: parents.split(" ").filter(Boolean)[0] ?? null,
-        authorName: authorName || "Unknown",
-        authorEmail: authorEmail || "",
-        committerDate: Number(ts),
-        subject: subjectParts.join("\x00"),
-      };
-    });
+function consumeHeader(record: string): { commit: Omit<ParsedCommit, "changes">; body: string } | null {
+  const newline = record.indexOf("\n");
+  const header = (newline === -1 ? record : record.slice(0, newline)).replace(/^\n+/, "").trimStart();
+  const body = newline === -1 ? "" : record.slice(newline + 1);
+  const parts = header.split("\x00");
+  if (parts.length < 8 || !parts[0]) return null;
+  const [sha, parents, authorName, authorEmail, rawAuthorName, rawAuthorEmail, timestamp, ...subjectParts] = parts;
+  return {
+    commit: {
+      sha: sha.trim(),
+      parentSha: parents.split(" ").filter(Boolean)[0] ?? null,
+      authorName: authorName || "Unknown",
+      authorEmail: authorEmail || "",
+      rawAuthorName: rawAuthorName || authorName || "Unknown",
+      rawAuthorEmail: rawAuthorEmail || authorEmail || "",
+      committerDate: Number(timestamp),
+      subject: subjectParts.join("\x00"),
+    },
+    body,
+  };
 }
 
-function parseNumstat(repoPath: string, sha: string): ParsedChange[] {
-  const output = execFileSync("git", ["diff-tree", "--root", "--no-commit-id", "-r", "-M50%", "--numstat", "-z", sha], {
-    cwd: repoPath,
-    encoding: "buffer",
-    maxBuffer: 1024 * 1024 * 256,
-    stdio: ["ignore", "pipe", "pipe"],
-  }).toString("utf8");
-
-  const tokens = output.split("\x00").filter((token) => token.length > 0);
+function parseNumstatBody(body: string): ParsedChange[] {
+  const tokens = body.split("\x00").map((token) => token.replace(/^\n+/, "")).filter((token) => token.length > 0);
   const changes: ParsedChange[] = [];
+
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     const parts = token.split("\t");
     if (parts.length < 3) continue;
     const [addedRaw, removedRaw, pathPart] = parts;
+    const isRename = pathPart === "";
+
     if (addedRaw === "-" || removedRaw === "-") {
-      if (pathPart === "") index += 2;
+      if (isRename) index += 2;
       continue;
     }
 
     const added = Number(addedRaw);
     const removed = Number(removedRaw);
-    if (!Number.isFinite(added) || !Number.isFinite(removed)) continue;
+    if (!Number.isFinite(added) || !Number.isFinite(removed)) {
+      if (isRename) index += 2;
+      continue;
+    }
 
     let changedPath = pathPart;
-    if (pathPart === "") {
+    if (isRename) {
       index += 2;
       changedPath = tokens[index] ?? "";
     }
-    if (!changedPath) continue;
-    changes.push({ path: changedPath, added, removed });
+    if (changedPath) changes.push({ path: changedPath, added, removed });
   }
+
   return changes;
+}
+
+export function parseGitLogNumstat(repoPath: string): ParsedCommit[] {
+  const output = git(
+    [
+      "log",
+      "--no-merges",
+      "--reverse",
+      "--numstat",
+      "-z",
+      "-M50%",
+      "--root",
+      "--format=%x1e%H%x00%P%x00%aN%x00%aE%x00%an%x00%ae%x00%ct%x00%s",
+      "HEAD",
+    ],
+    repoPath,
+  );
+
+  return output
+    .split("\x1e")
+    .map((record) => record.trimStart())
+    .filter(Boolean)
+    .map((record) => {
+      const parsed = consumeHeader(record);
+      if (!parsed) return null;
+      return { ...parsed.commit, changes: parseNumstatBody(parsed.body) };
+    })
+    .filter((commit): commit is ParsedCommit => commit !== null);
 }
 
 export function ancestorDirectories(filePath: string): string[] {
@@ -127,11 +174,12 @@ function rollUpDirectories(repositoryId: number, commitSha: string, changes: Fil
   }));
 }
 
-export async function analyzeRepository(repositoryId: number, repoPath: string): Promise<void> {
+export async function analyzeRepository(repositoryId: number, repoPath: string, onProgress?: AnalysisProgress): Promise<void> {
   await updateRepositoryStatus(repositoryId, "analyzing");
   try {
     ensureGitRepository(repoPath);
-    const parsedCommits = parseCommits(repoPath);
+    await onProgress?.("parsing", 20, "Reading git history");
+    const parsedCommits = parseGitLogNumstat(repoPath);
     const db = await openDatabase();
     const authorByIdentity = new Map<string, number>();
     const commits: CommitRecord[] = [];
@@ -147,19 +195,22 @@ export async function analyzeRepository(repositoryId: number, repoPath: string):
       }
     });
 
-    parsedCommits.forEach((parsed, ordinal) => {
+    for (let ordinal = 0; ordinal < parsedCommits.length; ordinal += 1) {
+      const parsed = parsedCommits[ordinal];
       const authorId = authorByIdentity.get(`${parsed.authorName}\x00${parsed.authorEmail}`)!;
       commits.push({
         repositoryId,
         sha: parsed.sha,
         parentSha: parsed.parentSha,
         authorId,
+        rawAuthorName: parsed.rawAuthorName,
+        rawAuthorEmail: parsed.rawAuthorEmail,
         committerDate: parsed.committerDate,
         subject: parsed.subject,
         ordinal,
       });
 
-      const commitChanges = parseNumstat(repoPath, parsed.sha).map((change) => ({
+      const commitChanges = parsed.changes.map((change) => ({
         repositoryId,
         commitSha: parsed.sha,
         path: change.path,
@@ -168,9 +219,18 @@ export async function analyzeRepository(repositoryId: number, repoPath: string):
       }));
       changes.push(...commitChanges);
       dirMetrics.push(...rollUpDirectories(repositoryId, parsed.sha, commitChanges));
-    });
 
+      if (ordinal % 100 === 0 || ordinal === parsedCommits.length - 1) {
+        const progress = 20 + Math.round(((ordinal + 1) / Math.max(parsedCommits.length, 1)) * 60);
+        await onProgress?.("parsing", progress, `Parsed ${ordinal + 1} of ${parsedCommits.length} commits`);
+        await updateRepositoryProgress(repositoryId, "analyzing", "parsing", progress);
+      }
+    }
+
+    await onProgress?.("indexing", 85, "Persisting metric indexes");
+    await updateRepositoryProgress(repositoryId, "indexing", "indexing", 85);
     await replaceRepositoryAnalysis({ repositoryId, commits, changes, dirMetrics });
+    await onProgress?.("done", 100, "Analysis complete");
   } catch (error) {
     await updateRepositoryStatus(repositoryId, "failed", error instanceof Error ? error.message : String(error));
     throw error;
