@@ -67,6 +67,7 @@ export default function Home() {
   const [metrics, setMetrics] = useState<MetricsResult>(emptyMetrics);
   const [authors, setAuthors] = useState<Author[]>([]);
   const [commits, setCommits] = useState<CommitListRow[]>([]);
+  const [breakdownFiles, setBreakdownFiles] = useState<MetricRow[]>([]);
   const [authorId, setAuthorId] = useState("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
@@ -346,10 +347,13 @@ function MetricVisualizations({ metrics }: { metrics: MetricsResult }) {
   const topObjects = [...metrics.directories, ...metrics.files]
     .filter((row) => row.churn > 0)
     .sort((a, b) => b.churn - a.churn)
-    .slice(0, 6);
-  const topAuthors = metrics.authors.slice(0, 6);
+    .slice(0, 8);
+  const topAuthors = metrics.authors.slice(0, 8);
   const maxFlow = Math.max(1, ...flow.map((item) => item.value));
   const maxObject = Math.max(1, ...topObjects.map((item) => item.churn));
+  const changedLines = metrics.summary.added + metrics.summary.removed;
+  const addedAngle = changedLines === 0 ? 0 : Math.round((metrics.summary.added / changedLines) * 360);
+  const topAuthor = topAuthors[0];
 
   return (
     <section className="visual-grid" aria-label="Metric visualizations">
@@ -359,13 +363,20 @@ function MetricVisualizations({ metrics }: { metrics: MetricsResult }) {
           {flow.map((item) => <div className="bar-row" key={item.label}><span>{item.label}</span><div className="bar-track"><i className={item.className} style={{ width: `${(item.value / maxFlow) * 100}%` }} /></div><strong>{number(item.value)}</strong></div>)}
         </div>
       </div>
+      <div className="panel chart-panel pie-panel">
+        <div className="section-title"><div><h2>Added vs removed</h2><p>Pie split of changed lines in the current commit set.</p></div></div>
+        <div className="pie-wrap" aria-label="Added versus removed pie chart">
+          <div className="pie-chart" style={{ background: `conic-gradient(#22c55e 0deg ${addedAngle}deg, #ef4444 ${addedAngle}deg 360deg)` }}><span>{changedLines === 0 ? "0" : percent(metrics.summary.added / changedLines)}</span></div>
+          <div className="legend"><span><i className="legend-added" />Added {number(metrics.summary.added)}</span><span><i className="legend-removed" />Removed {number(metrics.summary.removed)}</span></div>
+        </div>
+      </div>
       <div className="panel chart-panel">
         <div className="section-title"><div><h2>Top churned objects</h2><p>Highest-churn files and directories in the current page/filter.</p></div></div>
         {topObjects.length === 0 ? <p className="empty-state">No churn in the selected commit set.</p> : <div className="bar-list compact" aria-label="Top churned objects chart">{topObjects.map((item) => <div className="bar-row" key={`${item.kind}:${item.path}`}><span title={item.path}>{item.path || "(root)"}</span><div className="bar-track"><i className="churn" style={{ width: `${(item.churn / maxObject) * 100}%` }} /></div><strong>{number(item.churn)}</strong></div>)}</div>}
       </div>
-      <div className="panel chart-panel ownership-panel">
+      <div className="panel chart-panel ownership-panel wide-chart">
         <div className="section-title"><div><h2>Author ownership</h2><p>Ownership share for the selected repository object.</p></div></div>
-        {topAuthors.length === 0 ? <p className="empty-state">No author ownership data for this selection.</p> : <div className="donut-list" aria-label="Author ownership chart">{topAuthors.map((author) => <div className="owner-row" key={author.authorId}><span>{author.name}</span><div className="owner-track"><i style={{ width: `${Math.max(0, Math.min(100, author.ownership * 100))}%` }} /></div><strong>{percent(author.ownership)}</strong></div>)}</div>}
+        {topAuthors.length === 0 ? <p className="empty-state">No author ownership data for this selection.</p> : <><div className="ownership-summary"><strong>{topAuthor?.name ?? "No owner"}</strong><span>{topAuthor ? `${percent(topAuthor.ownership)} leading ownership` : "No ownership"}</span></div><div className="donut-list" aria-label="Author ownership chart">{topAuthors.map((author) => <div className="owner-row" key={author.authorId}><span>{author.name}</span><div className="owner-track"><i style={{ width: `${Math.max(0, Math.min(100, author.ownership * 100))}%` }} /></div><strong>{percent(author.ownership)}</strong></div>)}</div></>}
       </div>
     </section>
   );
@@ -377,9 +388,20 @@ function MetricTable({ title, rows, total, offset, limit, sortBy, sortDir, onSor
 }
 
 function AuthorTable({ rows }: { rows: AuthorMetricRow[] }) {
-  return <section className="panel"><div className="section-title"><div><h2>Author ownership of selected object</h2><p>Ownership is author churn divided by total object churn.</p></div></div><div className="table-wrap"><table><thead><tr><th>Author</th><th>Modifications</th><th>Churn</th><th>Ownership</th></tr></thead><tbody>{rows.length === 0 ? <tr><td colSpan={4} className="empty-state">No author rows match the current filters.</td></tr> : rows.map((row) => <tr key={row.authorId}><td>{row.name} &lt;{row.email}&gt;</td><td>{number(row.modifications)}</td><td>{number(row.churn)}</td><td>{percent(row.ownership)}</td></tr>)}</tbody></table></div></section>;
+  const [page, setPage] = useState(0);
+  const pageSize = 10;
+  const visibleRows = rows.slice(page * pageSize, page * pageSize + pageSize);
+  const canNext = (page + 1) * pageSize < rows.length;
+  return <section className="panel"><div className="section-title"><div><h2>Author ownership of selected object</h2><p>Ownership is author churn divided by total object churn.</p></div></div><div className="toolbar"><button type="button" className="ghost" disabled={page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}>Previous authors</button><span className="muted">Showing {rows.length === 0 ? 0 : page * pageSize + 1}-{Math.min(rows.length, page * pageSize + visibleRows.length)} of {rows.length}</span><button type="button" className="ghost" disabled={!canNext} onClick={() => setPage((current) => current + 1)}>Next authors</button></div><div className="table-wrap"><table><thead><tr><th>Author</th><th>Modifications</th><th>Churn</th><th>Ownership</th></tr></thead><tbody>{rows.length === 0 ? <tr><td colSpan={4} className="empty-state">No author rows match the current filters.</td></tr> : visibleRows.map((row) => <tr key={row.authorId}><td>{row.name} &lt;{row.email}&gt;</td><td>{number(row.modifications)}</td><td>{number(row.churn)}</td><td>{percent(row.ownership)}</td></tr>)}</tbody></table></div></section>;
 }
 
 function AuthorMergePanel({ authors, target, sources, setTarget, setSources, onMerge }: { authors: Author[]; target: string; sources: string[]; setTarget: (value: string) => void; setSources: (value: string[]) => void; onMerge: () => void }) {
-  return <section className="panel"><div className="section-title"><div><h2>Manual author merge</h2><p>Merge identities after mailmap resolution by reassigning persisted commit author IDs.</p></div></div><div className="control-grid"><label>Keep author<select value={target} onChange={(event) => setTarget(event.target.value)}><option value="">Choose target</option>{authors.map((author) => <option key={author.id} value={author.id}>{author.displayName}</option>)}</select></label><label>Merge these authors<select multiple value={sources} onChange={(event) => setSources(Array.from(event.target.selectedOptions).map((option) => option.value))}>{authors.filter((author) => String(author.id) !== target).map((author) => <option key={author.id} value={author.id}>{author.displayName}</option>)}</select></label><button type="button" className="secondary-action" disabled={!target || sources.length === 0} onClick={onMerge}>Merge authors</button></div></section>;
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(0);
+  const pageSize = 20;
+  const filteredAuthors = authors.filter((author) => author.displayName.toLowerCase().includes(query.toLowerCase()));
+  const sourceAuthors = filteredAuthors.filter((author) => String(author.id) !== target);
+  const visibleSources = sourceAuthors.slice(page * pageSize, page * pageSize + pageSize);
+  const canNext = (page + 1) * pageSize < sourceAuthors.length;
+  return <section className="panel"><div className="section-title"><div><h2>Manual author merge</h2><p>Search and page through author identities before merging them into one resolved author.</p></div></div><div className="control-grid"><label>Search authors<input value={query} onChange={(event) => { setQuery(event.target.value); setPage(0); }} placeholder="name or email" /></label><label>Keep author<select value={target} onChange={(event) => setTarget(event.target.value)}><option value="">Choose target</option>{filteredAuthors.map((author) => <option key={author.id} value={author.id}>{author.displayName}</option>)}</select></label><label>Merge these authors<select multiple value={sources} onChange={(event) => setSources(Array.from(event.target.selectedOptions).map((option) => option.value))}>{visibleSources.map((author) => <option key={author.id} value={author.id}>{author.displayName}</option>)}</select></label><button type="button" className="secondary-action" disabled={!target || sources.length === 0} onClick={onMerge}>Merge authors</button></div><div className="toolbar"><button type="button" className="ghost" disabled={page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}>Previous merge page</button><span className="muted">Source authors {sourceAuthors.length === 0 ? 0 : page * pageSize + 1}-{Math.min(sourceAuthors.length, page * pageSize + visibleSources.length)} of {sourceAuthors.length}</span><button type="button" className="ghost" disabled={!canNext} onClick={() => setPage((current) => current + 1)}>Next merge page</button></div></section>;
 }

@@ -18,6 +18,8 @@ describe("dashboard UI regression coverage", () => {
     expect(styles).toContain(".metrics-grid");
     expect(styles).toContain(".visual-grid");
     expect(styles).toContain(".chart-panel");
+    expect(styles).toContain(".pie-chart");
+    expect(styles).toContain(".ownership-summary");
     expect(styles).toContain("background:");
   });
 
@@ -26,17 +28,22 @@ describe("dashboard UI regression coverage", () => {
 
     expect(page).toContain("MetricVisualizations");
     expect(page).toContain("Change flow");
+    expect(page).toContain("Added vs removed");
+    expect(page).toContain("Added versus removed pie chart");
     expect(page).toContain("Top churned objects");
     expect(page).toContain("Author ownership");
     expect(page).toContain("aria-label=\"Metric visualizations\"");
   });
 
-  it("keeps the required explicit path selector and commit-picker fix", () => {
+  it("keeps the required explicit path selector, commit-picker fix, and author pagination", () => {
     const page = read("app/page.tsx");
 
     expect(page).toContain("Path type");
     expect(page).toContain("setPathSearchKind");
     expect(page).toContain('commitParams.delete("commits")');
+    expect(page).toContain("Next authors");
+    expect(page).toContain("Search authors");
+    expect(page).toContain("Next merge page");
     expect(page).not.toContain('pathSearch.includes(".")');
   });
 

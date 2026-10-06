@@ -34,9 +34,12 @@ async function parseCreateRequest(request: Request): Promise<{ sourceType: RepoS
   }
 
   const file = form.get("file");
-  if (!(file instanceof File)) throw new Error("zip ingestion requires a file field");
+  if (!file || typeof file !== "object" || !("arrayBuffer" in file) || typeof file.arrayBuffer !== "function") {
+    throw new Error("zip ingestion requires a file field");
+  }
+  const fileName = "name" in file && typeof file.name === "string" && file.name ? file.name : "uploaded.zip";
   const zipBuffer = Buffer.from(await file.arrayBuffer());
-  return { sourceType: "zip", source: file.name || "uploaded.zip", name, zipBuffer };
+  return { sourceType: "zip", source: fileName, name, zipBuffer };
 }
 
 export async function POST(request: Request) {

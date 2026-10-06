@@ -9,6 +9,18 @@ type Row = Record<string, SqlValue>;
 let sqlPromise: Promise<SqlJsStatic> | null = null;
 let dbPromise: Promise<Database> | null = null;
 
+// Monotonic counter bumped by every mutating helper (run/transaction) so
+// withDatabase can skip exporting + rewriting the whole database file for
+// read-only calls. The UI polls the API while an ingest runs, so unguarded
+// persistence turns every GET into a full-file write.
+let mutationCount = 0;
+
+// Bound how often the database file is rewritten even when writes are
+// happening (e.g. ingest progress updates). In-memory state is always
+// current for readers; the file only matters for durability across restarts.
+const PERSIST_THROTTLE_MS = 2000;
+let lastPersistAtMs = Number.NEGATIVE_INFINITY;
+
 function sqlWasmPath(file: string): string {
   return path.join(process.cwd(), "node_modules", "sql.js", "dist", file);
 }
@@ -48,22 +60,32 @@ export async function openDatabase(): Promise<Database> {
 
 export function resetDatabaseConnectionForTests(): void {
   dbPromise = null;
+  lastPersistAtMs = Number.NEGATIVE_INFINITY;
 }
 
-export function persistDatabase(db: Database): void {
+export function persistDatabase(db: Database, options: { force?: boolean } = {}): void {
+  const nowMs = Date.now();
+  if (!options.force && nowMs - lastPersistAtMs < PERSIST_THROTTLE_MS) return;
+  lastPersistAtMs = nowMs;
   const dbFile = databasePath();
   fs.mkdirSync(path.dirname(dbFile), { recursive: true });
   fs.writeFileSync(dbFile, Buffer.from(db.export()));
 }
 
-export async function withDatabase<T>(fn: (db: Database) => T): Promise<T> {
+export async function flushDatabase(): Promise<void> {
+  persistDatabase(await openDatabase(), { force: true });
+}
+
+export async function withDatabase<T>(fn: (db: Database) => T | Promise<T>): Promise<T> {
   const db = await openDatabase();
-  const result = fn(db);
-  persistDatabase(db);
+  const mutationsBefore = mutationCount;
+  const result = await fn(db);
+  if (mutationCount !== mutationsBefore) persistDatabase(db);
   return result;
 }
 
 export function transaction<T>(db: Database, fn: () => T): T {
+  mutationCount += 1;
   db.run("BEGIN IMMEDIATE TRANSACTION");
   try {
     const result = fn();
@@ -76,6 +98,7 @@ export function transaction<T>(db: Database, fn: () => T): T {
 }
 
 export function run(db: Database, sql: string, params: BindParams = []): void {
+  mutationCount += 1;
   const stmt = db.prepare(sql);
   try {
     stmt.run(params);

@@ -231,11 +231,30 @@ label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; font-weig
 
 .visual-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 20px;
   margin-top: 20px;
 }
 .chart-panel { min-height: 300px; }
+.wide-chart { grid-column: span 2; }
+.pie-wrap { display: grid; justify-items: center; gap: 18px; padding: 8px 0; }
+.pie-chart {
+  display: grid;
+  place-items: center;
+  width: 164px;
+  height: 164px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 18px rgb(255 255 255 / 78%), var(--soft-shadow);
+}
+.pie-chart span { display: grid; place-items: center; width: 86px; height: 86px; border-radius: 50%; background: white; color: var(--text); font-weight: 900; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; color: var(--muted); font-size: 13px; font-weight: 800; }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.legend i { width: 11px; height: 11px; border-radius: 50%; }
+.legend-added { background: #22c55e; }
+.legend-removed { background: #ef4444; }
+.ownership-summary { display: grid; gap: 4px; margin-bottom: 14px; padding: 12px 14px; border-radius: 16px; background: #eff6ff; border: 1px solid #bfdbfe; }
+.ownership-summary strong { font-size: 20px; }
+.ownership-summary span { color: var(--muted); }
 .bar-list, .donut-list { display: grid; gap: 14px; }
 .bar-row, .owner-row {
   display: grid;
@@ -274,6 +293,7 @@ tbody tr:last-child td { border-bottom: 0; }
 
 @media (max-width: 980px) {
   .hero, .repo-strip, .visual-grid { grid-template-columns: 1fr; }
+  .wide-chart { grid-column: auto; }
 }
 
 @media (max-width: 640px) {

@@ -62,8 +62,8 @@ Git analysis uses one non-merge `git log --numstat -z -M50% --root` pass with co
 - Repository ingestion from local path, remote Git URL, or zip upload containing `.git`.
 - Multi-repository switcher and staged ingest progress.
 - Filter bar for author, date range, explicit path type, path, and manual commit set.
-- Summary cards, sortable/paginated directory and file tables, breadcrumbs, author ownership, and manual author merge.
-- Visualizations for change flow, top churned objects, and author ownership.
+- Summary cards, sortable/paginated directory, file, and author tables, breadcrumbs, author ownership, and searchable/paginated manual author merge.
+- Visualizations for change flow, added-vs-removed pie split, top churned objects, and author ownership.
 
 ## Third-party packages
 

@@ -1,10 +1,13 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
 import { openDatabase, transaction } from "./db";
 import { repositoriesDir } from "./paths";
 import { findOrCreateAuthor, replaceRepositoryAnalysis, updateRepositoryProgress, updateRepositoryStatus } from "./repositories";
 import type { CommitRecord, DirMetric, FileChange, JobStage, ObjectKind, ObjectLifetime } from "./types";
+
+const execFileAsync = promisify(execFile);
 
 type ParsedCommit = {
   sha: string;
@@ -26,38 +29,41 @@ type ParsedChange = {
 
 export type AnalysisProgress = (stage: JobStage, progress: number, message: string) => Promise<void> | void;
 
-function git(args: string[], cwd?: string, encoding: BufferEncoding = "utf8"): string {
-  return execFileSync("git", args, {
+// git operations must stay async: the server handles UI polling on the same
+// event loop, so a synchronous clone/log would freeze every request (the
+// dashboard then sits at "cloning 5%" forever).
+async function git(args: string[], cwd?: string): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, {
     cwd,
-    encoding,
-    maxBuffer: 1024 * 1024 * 512,
-    stdio: ["ignore", "pipe", "pipe"],
-  }) as string;
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 1024,
+  });
+  return stdout;
 }
 
-export function ensureGitAvailable(): void {
+export async function ensureGitAvailable(): Promise<void> {
   try {
-    git(["--version"]);
+    await git(["--version"]);
   } catch {
     throw new Error("git is not installed or is not available on PATH");
   }
 }
 
-export function ensureGitRepository(repoPath: string): void {
-  ensureGitAvailable();
+export async function ensureGitRepository(repoPath: string): Promise<void> {
+  await ensureGitAvailable();
   if (!fs.existsSync(repoPath)) throw new Error(`Path does not exist: ${repoPath}`);
-  const inside = git(["rev-parse", "--is-inside-work-tree"], repoPath).trim();
+  const inside = (await git(["rev-parse", "--is-inside-work-tree"], repoPath)).trim();
   if (inside !== "true") throw new Error(`Path is not a git work tree: ${repoPath}`);
   const gitPath = path.join(repoPath, ".git");
   if (!fs.existsSync(gitPath)) throw new Error(`Repository must include a .git file or directory: ${repoPath}`);
 }
 
-export function cloneRepository(url: string, repositoryId: number): string {
-  ensureGitAvailable();
+export async function cloneRepository(url: string, repositoryId: number): Promise<string> {
+  await ensureGitAvailable();
   fs.mkdirSync(repositoriesDir(), { recursive: true });
   const target = path.join(repositoriesDir(), String(repositoryId));
   if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
-  git(["clone", "--", url, target]);
+  await git(["clone", "--", url, target]);
   return target;
 }
 
@@ -117,8 +123,8 @@ function parseNumstatBody(body: string): ParsedChange[] {
   return changes;
 }
 
-export function parseGitLogNumstat(repoPath: string): ParsedCommit[] {
-  const output = git(
+export async function parseGitLogNumstat(repoPath: string): Promise<ParsedCommit[]> {
+  const output = await git(
     [
       "log",
       "--no-merges",
@@ -189,9 +195,9 @@ function rollUpDirectories(repositoryId: number, commitSha: string, changes: Fil
 export async function analyzeRepository(repositoryId: number, repoPath: string, onProgress?: AnalysisProgress): Promise<void> {
   await updateRepositoryStatus(repositoryId, "analyzing");
   try {
-    ensureGitRepository(repoPath);
+    await ensureGitRepository(repoPath);
     await onProgress?.("parsing", 20, "Reading git history");
-    const parsedCommits = parseGitLogNumstat(repoPath);
+    const parsedCommits = await parseGitLogNumstat(repoPath);
     const db = await openDatabase();
     const authorByIdentity = new Map<string, number>();
     const commits: CommitRecord[] = [];

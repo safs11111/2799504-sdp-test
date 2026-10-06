@@ -1,4 +1,5 @@
 import { analyzeRepository, cloneRepository, ensureGitAvailable, ensureGitRepository } from "./git";
+import { flushDatabase } from "./db";
 import { updateIngestJob, updateRepositoryLocalPath, updateRepositoryProgress, updateRepositoryStatus } from "./repositories";
 import type { RepoSourceType } from "./types";
 import { extractRepositoryZip } from "./zip";
@@ -21,13 +22,13 @@ async function setProgress(input: IngestInput, status: "cloning" | "extracting" 
 
 async function runIngest(input: IngestInput): Promise<void> {
   try {
-    ensureGitAvailable();
+    await ensureGitAvailable();
     await setProgress(input, "analyzing", 1, "Starting ingest");
 
     let localPath = input.source;
     if (input.sourceType === "url") {
       await setProgress(input, "cloning", 5, "Cloning repository");
-      localPath = cloneRepository(input.source, input.repositoryId);
+      localPath = await cloneRepository(input.source, input.repositoryId);
       await updateRepositoryLocalPath(input.repositoryId, localPath);
     } else if (input.sourceType === "zip") {
       if (!input.zipBuffer) throw new Error("Zip upload did not include file data");
@@ -35,7 +36,7 @@ async function runIngest(input: IngestInput): Promise<void> {
       localPath = extractRepositoryZip(input.zipBuffer, input.repositoryId);
       await updateRepositoryLocalPath(input.repositoryId, localPath);
     } else {
-      ensureGitRepository(localPath);
+      await ensureGitRepository(localPath);
     }
 
     await analyzeRepository(input.repositoryId, localPath, async (stage, progress, message) => {
@@ -48,9 +49,18 @@ async function runIngest(input: IngestInput): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     await updateRepositoryStatus(input.repositoryId, "failed", message);
     await setProgress(input, "failed", 100, "Repository ingest failed", message);
+  } finally {
+    // Persist the terminal state even if this ingest ran inside a throttled
+    // window, so a restart never resurrects a finished job as stale.
+    await flushDatabase();
   }
 }
 
 export function enqueueIngest(input: IngestInput): void {
-  queue = queue.then(() => runIngest(input), () => runIngest(input));
+  // Defer past the current request so the client receives the 202 response
+  // before any heavy clone/extract work begins. runIngest never rejects
+  // (it records failures on the job), the catch is just a safety net.
+  setTimeout(() => {
+    queue = queue.then(() => runIngest(input)).catch(() => {});
+  }, 25);
 }

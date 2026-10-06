@@ -273,4 +273,53 @@ describe("repository analysis foundation", () => {
     expect(() => safeJoin(tempRoot, "/tmp/evil.txt")).toThrow(/Unsafe zip entry path/);
 
   });
+
+  it("runs queued ingests asynchronously and flushes terminal state to disk", async () => {
+    const repo = createFixtureRepo();
+    const { createIngestJob, createRepository, getIngestJobById, getRepositoryById } = await import("../lib/repositories");
+    const { enqueueIngest } = await import("../lib/ingest");
+
+    const record = await createRepository({ name: "queued", sourceType: "path", source: repo, localPath: repo });
+    const job = await createIngestJob(record.id);
+    enqueueIngest({ jobId: job.id, repositoryId: record.id, sourceType: "path", source: repo });
+
+    // Regression: the enqueue path must hand control back immediately (the
+    // API route has to flush its 202 response instead of blocking on ingest).
+    const immediate = await getIngestJobById(job.id);
+    expect(immediate?.status).not.toBe("done");
+
+    const deadline = Date.now() + 20000;
+    let finalJob: Awaited<ReturnType<typeof getIngestJobById>> = immediate;
+    while (Date.now() < deadline) {
+      finalJob = await getIngestJobById(job.id);
+      if (finalJob?.status === "done" || finalJob?.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(finalJob?.status).toBe("done");
+
+    const stored = await getRepositoryById(record.id);
+    expect(stored?.status).toBe("ready");
+    // The terminal state must survive on disk, not just in memory.
+    expect(fs.existsSync(process.env.RAT_DB_PATH ?? "")).toBe(true);
+  });
+
+  it("accepts multipart zip uploads without depending on a global File constructor", async () => {
+    const repo = createFixtureRepo();
+    const zip = new AdmZip();
+    zip.addLocalFolder(repo, "wrapped");
+    const form = new FormData();
+    form.set("sourceType", "zip");
+    form.set("name", "uploaded fixture");
+    const zipBytes = zip.toBuffer();
+    const zipArrayBuffer = zipBytes.buffer.slice(zipBytes.byteOffset, zipBytes.byteOffset + zipBytes.byteLength) as ArrayBuffer;
+    form.set("file", new Blob([zipArrayBuffer], { type: "application/zip" }), "fixture.zip");
+
+    const { POST } = await import("../app/api/repositories/route");
+    const response = await POST(new Request("http://localhost/api/repositories", { method: "POST", body: form }));
+    const payload = await response.json() as { job?: { id: number }; error?: string };
+
+    expect(response.status).toBe(202);
+    expect(payload.error).toBeUndefined();
+    expect(payload.job?.id).toBeTypeOf("number");
+  });
 });
