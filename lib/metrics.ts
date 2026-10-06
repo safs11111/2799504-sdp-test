@@ -94,19 +94,28 @@ export function paginationFromRequest(requestUrl: string): Pagination {
   return paginationFromUrl(new URL(requestUrl));
 }
 
-function aggregateListSql(table: "changes" | "dir_metrics", pathColumn: "path" | "dir_path", kind: ObjectKind, repositoryId: number, filters: MetricFilters, basePath: string, pagination: Pagination) {
+function aggregateListSql(
+  table: "changes" | "dir_metrics",
+  pathColumn: "path" | "dir_path",
+  kind: ObjectKind,
+  repositoryId: number,
+  filters: MetricFilters,
+  basePath: string,
+  pagination: Pagination,
+  denominatorCommits: number,
+  maxOrdinal: number,
+) {
   const commitFilter = commitFilterSql(repositoryId, filters);
-  const subtree = subtreeCondition(pathColumn, basePath);
+  const lifetimeSubtree = subtreeCondition("ol.path", basePath);
+  const metricSubtree = subtreeCondition(`m.${pathColumn}`, basePath);
   const sort = sortExpressions[pagination.sortBy];
   const direction = pagination.sortDir.toUpperCase();
-  const denominatorSql = `CASE WHEN ? = 0 THEN 0.0 ELSE CAST(COALESCE(agg.modifications, 0) AS REAL) / ? END`;
-  const churnRateSql = `CASE WHEN ? = 0 THEN 0.0 ELSE CAST((COALESCE(agg.added, 0) + COALESCE(agg.removed, 0)) AS REAL) / ? END`;
 
   return {
     sql: `WITH base AS (
-            SELECT DISTINCT ${pathColumn} AS path
-            FROM ${table}
-            WHERE repository_id = ? AND ${subtree.sql}
+            SELECT ol.path AS path
+            FROM object_lifetimes ol
+            WHERE ol.repository_id = ? AND ol.kind = ? AND ol.first_ordinal <= ? AND ${lifetimeSubtree.sql}
           ), agg AS (
             SELECT m.${pathColumn} AS path,
                    COALESCE(SUM(m.added), 0) AS added,
@@ -114,7 +123,7 @@ function aggregateListSql(table: "changes" | "dir_metrics", pathColumn: "path" |
                    COALESCE(SUM(CASE WHEN (m.added + m.removed) > 0 THEN 1 ELSE 0 END), 0) AS modifications
             FROM ${table} m
             JOIN commits c ON c.repository_id = m.repository_id AND c.sha = m.commit_sha
-            WHERE ${commitFilter.where} AND ${subtreeCondition(`m.${pathColumn}`, basePath).sql}
+            WHERE ${commitFilter.where} AND ${metricSubtree.sql}
             GROUP BY m.${pathColumn}
           )
           SELECT base.path AS path,
@@ -123,14 +132,26 @@ function aggregateListSql(table: "changes" | "dir_metrics", pathColumn: "path" |
                  (COALESCE(agg.added, 0) - COALESCE(agg.removed, 0)) AS growth,
                  (COALESCE(agg.added, 0) + COALESCE(agg.removed, 0)) AS churn,
                  COALESCE(agg.modifications, 0) AS modifications,
-                 ${denominatorSql} AS modificationFrequency,
-                 ${churnRateSql} AS churnRate
+                 CASE WHEN ? = 0 THEN 0.0 ELSE CAST(COALESCE(agg.modifications, 0) AS REAL) / ? END AS modificationFrequency,
+                 CASE WHEN ? = 0 THEN 0.0 ELSE CAST((COALESCE(agg.added, 0) + COALESCE(agg.removed, 0)) AS REAL) / ? END AS churnRate
           FROM base
           LEFT JOIN agg ON agg.path = base.path
           ORDER BY ${sort} ${direction}, path ASC
           LIMIT ? OFFSET ?`,
-    params: [repositoryId, ...subtree.params, ...commitFilter.params, ...subtreeCondition(`m.${pathColumn}`, basePath).params, 0, 0, 0, 0, pagination.limit, pagination.offset],
-    kind,
+    params: [
+      repositoryId,
+      kind,
+      maxOrdinal,
+      ...lifetimeSubtree.params,
+      ...commitFilter.params,
+      ...metricSubtree.params,
+      denominatorCommits,
+      denominatorCommits,
+      denominatorCommits,
+      denominatorCommits,
+      pagination.limit,
+      pagination.offset,
+    ],
   };
 }
 
@@ -144,6 +165,7 @@ export async function getRepositoryMetrics(
   return withDatabase((db) => {
     const commitFilter = commitFilterSql(repositoryId, filters);
     const denominatorCommits = scalar(db, `SELECT COUNT(*) AS value FROM commits c WHERE ${commitFilter.where}`, commitFilter.params);
+    const maxOrdinal = denominatorCommits === 0 ? -1 : scalar(db, `SELECT COALESCE(MAX(c.ordinal), -1) AS value FROM commits c WHERE ${commitFilter.where}`, commitFilter.params);
     const sourceTable = kind === "file" ? "changes" : "dir_metrics";
     const pathColumn = kind === "file" ? "path" : "dir_path";
 
@@ -160,23 +182,23 @@ export async function getRepositoryMetrics(
     );
     const summary = metricRow(objectPath, kind, Number(summaryRow?.added ?? 0), Number(summaryRow?.removed ?? 0), Number(summaryRow?.modifications ?? 0), denominatorCommits);
 
-    const fileSubtree = kind === "file" ? subtreeCondition("path", objectPath) : subtreeCondition("path", objectPath);
-    const dirSubtree = kind === "file" ? subtreeCondition("dir_path", "") : subtreeCondition("dir_path", objectPath);
-    const fileTotal = scalar(db, `SELECT COUNT(DISTINCT path) AS value FROM changes WHERE repository_id = ? AND ${fileSubtree.sql}`, [repositoryId, ...fileSubtree.params]);
-    const directoryTotal = scalar(db, `SELECT COUNT(DISTINCT dir_path) AS value FROM dir_metrics WHERE repository_id = ? AND ${dirSubtree.sql}`, [repositoryId, ...dirSubtree.params]);
+    const fileSubtree = subtreeCondition("ol.path", objectPath);
+    const dirSubtree = subtreeCondition("ol.path", kind === "file" ? "" : objectPath);
+    const fileTotal = scalar(
+      db,
+      `SELECT COUNT(*) AS value FROM object_lifetimes ol WHERE repository_id = ? AND kind = 'file' AND first_ordinal <= ? AND ${fileSubtree.sql}`,
+      [repositoryId, maxOrdinal, ...fileSubtree.params],
+    );
+    const directoryTotal = scalar(
+      db,
+      `SELECT COUNT(*) AS value FROM object_lifetimes ol WHERE repository_id = ? AND kind = 'dir' AND first_ordinal <= ? AND ${dirSubtree.sql}`,
+      [repositoryId, maxOrdinal, ...dirSubtree.params],
+    );
 
-    const filesQuery = aggregateListSql("changes", "path", "file", repositoryId, filters, kind === "file" ? objectPath : objectPath, pagination);
-    filesQuery.params[filesQuery.params.length - 6] = denominatorCommits;
-    filesQuery.params[filesQuery.params.length - 5] = denominatorCommits;
-    filesQuery.params[filesQuery.params.length - 4] = denominatorCommits;
-    filesQuery.params[filesQuery.params.length - 3] = denominatorCommits;
+    const filesQuery = aggregateListSql("changes", "path", "file", repositoryId, filters, objectPath, pagination, denominatorCommits, maxOrdinal);
     const files = all<AggregateRow>(db, filesQuery.sql, filesQuery.params).map((row) => metricRow(row.path, "file", Number(row.added), Number(row.removed), Number(row.modifications), denominatorCommits));
 
-    const dirsQuery = aggregateListSql("dir_metrics", "dir_path", "dir", repositoryId, filters, kind === "file" ? "" : objectPath, pagination);
-    dirsQuery.params[dirsQuery.params.length - 6] = denominatorCommits;
-    dirsQuery.params[dirsQuery.params.length - 5] = denominatorCommits;
-    dirsQuery.params[dirsQuery.params.length - 4] = denominatorCommits;
-    dirsQuery.params[dirsQuery.params.length - 3] = denominatorCommits;
+    const dirsQuery = aggregateListSql("dir_metrics", "dir_path", "dir", repositoryId, filters, kind === "file" ? "" : objectPath, pagination, denominatorCommits, maxOrdinal);
     const directories = all<AggregateRow>(db, dirsQuery.sql, dirsQuery.params).map((row) => metricRow(row.path, "dir", Number(row.added), Number(row.removed), Number(row.modifications), denominatorCommits));
 
     const authorRows = all<AuthorAggregateRow>(

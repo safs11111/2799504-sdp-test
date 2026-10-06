@@ -203,6 +203,15 @@ export function applySchema(db: Database): void {
       PRIMARY KEY(repository_id, commit_sha, dir_path)
     );
 
+    CREATE TABLE IF NOT EXISTS object_lifetimes (
+      repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('file', 'dir')),
+      path TEXT NOT NULL,
+      first_ordinal INTEGER NOT NULL,
+      last_ordinal INTEGER NOT NULL,
+      PRIMARY KEY(repository_id, kind, path)
+    );
+
     CREATE TABLE IF NOT EXISTS ingest_jobs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
@@ -232,6 +241,8 @@ export function applySchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_changes_repo_commit_path ON changes(repository_id, commit_sha, path);
     CREATE INDEX IF NOT EXISTS idx_dir_metrics_repo_dir_sha ON dir_metrics(repository_id, dir_path, commit_sha);
     CREATE INDEX IF NOT EXISTS idx_dir_metrics_repo_commit_dir ON dir_metrics(repository_id, commit_sha, dir_path);
+    CREATE INDEX IF NOT EXISTS idx_object_lifetimes_repo_kind_path ON object_lifetimes(repository_id, kind, path);
+    CREATE INDEX IF NOT EXISTS idx_object_lifetimes_repo_kind_first ON object_lifetimes(repository_id, kind, first_ordinal);
     CREATE INDEX IF NOT EXISTS idx_jobs_repo ON ingest_jobs(repository_id, updated_at);
   `);
 }

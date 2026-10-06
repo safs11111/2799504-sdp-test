@@ -1,6 +1,6 @@
 import type { Database } from "sql.js";
 import { all, get, run, scalar, transaction, withDatabase } from "./db";
-import type { Author, CommitRecord, DirMetric, FileChange, IngestJob, JobStage, JobStatus, RepoSourceType, RepoStatus, Repository } from "./types";
+import type { Author, CommitRecord, DirMetric, FileChange, IngestJob, JobStage, JobStatus, ObjectLifetime, RepoSourceType, RepoStatus, Repository } from "./types";
 
 type RepoRow = {
   id: number;
@@ -106,7 +106,39 @@ export async function createRepository(input: {
 }
 
 export async function listRepositories(): Promise<Repository[]> {
-  return withDatabase((db) => all<RepoRow>(db, "SELECT * FROM repositories ORDER BY updated_at DESC").map(toRepository));
+  return withDatabase((db) => {
+    markStaleIngestJobsInDb(db);
+    return all<RepoRow>(db, "SELECT * FROM repositories ORDER BY updated_at DESC").map(toRepository);
+  });
+}
+
+export function markStaleIngestJobsInDb(db: Database, maxAgeSeconds = 3600): void {
+  const cutoff = now() - maxAgeSeconds;
+  const stale = all<{ id: number; repository_id: number }>(
+    db,
+    "SELECT id, repository_id FROM ingest_jobs WHERE status IN ('queued', 'running') AND updated_at < ?",
+    [cutoff],
+  );
+  for (const job of stale) {
+    run(
+      db,
+      `UPDATE ingest_jobs
+       SET status = 'failed', stage = 'failed', progress = 100, message = 'Ingest job became stale',
+           error_message = 'The server stopped before this ingest job completed. Please submit the repository again.',
+           updated_at = ?, completed_at = ?
+       WHERE id = ?`,
+      [now(), now(), job.id],
+    );
+    run(
+      db,
+      `UPDATE repositories
+       SET status = 'failed', current_stage = 'failed', progress = 100,
+           error_message = 'The server stopped before this ingest job completed. Please submit the repository again.',
+           updated_at = ?
+       WHERE id = ? AND status NOT IN ('ready', 'failed')`,
+      [now(), job.repository_id],
+    );
+  }
 }
 
 export async function getRepositoryById(id: number): Promise<Repository | null> {
@@ -261,9 +293,11 @@ export async function replaceRepositoryAnalysis(input: {
   commits: CommitRecord[];
   changes: FileChange[];
   dirMetrics: DirMetric[];
+  objectLifetimes?: ObjectLifetime[];
 }): Promise<void> {
   await withDatabase((db) => {
     transaction(db, () => {
+      run(db, "DELETE FROM object_lifetimes WHERE repository_id = ?", [input.repositoryId]);
       run(db, "DELETE FROM dir_metrics WHERE repository_id = ?", [input.repositoryId]);
       run(db, "DELETE FROM changes WHERE repository_id = ?", [input.repositoryId]);
       run(db, "DELETE FROM commits WHERE repository_id = ?", [input.repositoryId]);
@@ -312,6 +346,18 @@ export async function replaceRepositoryAnalysis(input: {
         }
       } finally {
         dirStmt.free();
+      }
+
+      const lifetimeStmt = db.prepare(
+        `INSERT INTO object_lifetimes (repository_id, kind, path, first_ordinal, last_ordinal)
+         VALUES (?, ?, ?, ?, ?)`,
+      );
+      try {
+        for (const item of input.objectLifetimes ?? []) {
+          lifetimeStmt.run([item.repositoryId, item.kind, item.path, item.firstOrdinal, item.lastOrdinal]);
+        }
+      } finally {
+        lifetimeStmt.free();
       }
 
       run(

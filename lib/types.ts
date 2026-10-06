@@ -68,6 +68,14 @@ export type DirMetric = {
   removed: number;
 };
 
+export type ObjectLifetime = {
+  repositoryId: number;
+  kind: ObjectKind;
+  path: string;
+  firstOrdinal: number;
+  lastOrdinal: number;
+};
+
 export type MetricFilters = {
   authorId?: number;
   from?: number;

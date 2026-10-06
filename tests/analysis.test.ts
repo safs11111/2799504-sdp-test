@@ -202,12 +202,60 @@ describe("repository analysis foundation", () => {
     expect(root.authors[0].ownership).toBe(1);
   });
 
+  it("keeps repository and directory metric invariants over filtered data", async () => {
+    const repo = createFixtureRepo();
+    const record = await analyzeFixture(repo);
+    const { getRepositoryMetrics } = await import("../lib/metrics");
+
+    const root = await getRepositoryMetrics(record.id, {}, "", "dir", { limit: 1000, offset: 0, sortBy: "path", sortDir: "asc" });
+    expect(root.summary.added).toBe(root.files.reduce((sum, file) => sum + file.added, 0));
+    expect(root.summary.removed).toBe(root.files.reduce((sum, file) => sum + file.removed, 0));
+    expect(root.summary.churn).toBe(root.files.reduce((sum, file) => sum + file.churn, 0));
+
+    const src = await getRepositoryMetrics(record.id, {}, "src", "dir", { limit: 1000, offset: 0, sortBy: "path", sortDir: "asc" });
+    expect(src.summary.added).toBe(src.files.reduce((sum, file) => sum + file.added, 0));
+    expect(src.summary.removed).toBe(src.files.reduce((sum, file) => sum + file.removed, 0));
+  });
+
+  it("does not list objects first seen after the selected commit window", async () => {
+    const repo = createFixtureRepo();
+    const record = await analyzeFixture(repo);
+    const { getRepositoryMetrics } = await import("../lib/metrics");
+
+    const early = await getRepositoryMetrics(record.id, { from: 1000, to: 2000 }, "", "dir", {
+      limit: 1000,
+      offset: 0,
+      sortBy: "path",
+      sortDir: "asc",
+    });
+    expect(early.files.some((file) => file.path === "main.txt")).toBe(false);
+    expect(early.files.some((file) => file.path === "feature.txt")).toBe(false);
+  });
+
+  it("marks stale ingest jobs as failed", async () => {
+    const repo = createFixtureRepo();
+    const { createIngestJob, createRepository, getIngestJobById, markStaleIngestJobsInDb } = await import("../lib/repositories");
+    const { withDatabase, run } = await import("../lib/db");
+
+    const record = await createRepository({ name: "stale", sourceType: "path", source: repo, localPath: repo });
+    const job = await createIngestJob(record.id);
+    await withDatabase((db) => {
+      run(db, "UPDATE ingest_jobs SET updated_at = 1 WHERE id = ?", [job.id]);
+      run(db, "UPDATE repositories SET status = 'analyzing', updated_at = 1 WHERE id = ?", [record.id]);
+      markStaleIngestJobsInDb(db, 0);
+    });
+
+    const staleJob = await getIngestJobById(job.id);
+    expect(staleJob?.status).toBe("failed");
+    expect(staleJob?.stage).toBe("failed");
+  });
+
   it("extracts zip repositories safely and rejects archives without .git", async () => {
     const repo = createFixtureRepo();
     const { createRepository } = await import("../lib/repositories");
     const { analyzeRepository } = await import("../lib/git");
     const { getRepositoryMetrics } = await import("../lib/metrics");
-    const { extractRepositoryZip } = await import("../lib/zip");
+    const { extractRepositoryZip, safeJoin } = await import("../lib/zip");
 
     const zip = new AdmZip();
     zip.addLocalFolder(repo, "wrapped");
@@ -221,6 +269,8 @@ describe("repository analysis foundation", () => {
     const badZip = new AdmZip();
     badZip.addFile("file.txt", Buffer.from("not a repo"));
     expect(() => extractRepositoryZip(badZip.toBuffer(), record.id + 1)).toThrow(/\.git/);
+    expect(() => safeJoin(tempRoot, "../evil.txt")).toThrow(/Unsafe zip entry path/);
+    expect(() => safeJoin(tempRoot, "/tmp/evil.txt")).toThrow(/Unsafe zip entry path/);
 
   });
 });

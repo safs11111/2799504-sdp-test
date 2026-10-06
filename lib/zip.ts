@@ -3,7 +3,7 @@ import path from "node:path";
 import AdmZip from "adm-zip";
 import { repositoriesDir } from "./paths";
 
-function safeJoin(root: string, relativePath: string): string {
+export function safeJoin(root: string, relativePath: string): string {
   const normalized = relativePath.replace(/\\/g, "/");
   if (path.isAbsolute(normalized) || normalized.split("/").includes("..")) {
     throw new Error(`Unsafe zip entry path: ${relativePath}`);

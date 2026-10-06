@@ -4,7 +4,7 @@ import path from "node:path";
 import { openDatabase, transaction } from "./db";
 import { repositoriesDir } from "./paths";
 import { findOrCreateAuthor, replaceRepositoryAnalysis, updateRepositoryProgress, updateRepositoryStatus } from "./repositories";
-import type { CommitRecord, DirMetric, FileChange, JobStage } from "./types";
+import type { CommitRecord, DirMetric, FileChange, JobStage, ObjectKind, ObjectLifetime } from "./types";
 
 type ParsedCommit = {
   sha: string;
@@ -154,6 +154,18 @@ export function ancestorDirectories(filePath: string): string[] {
   return dirs;
 }
 
+function touchLifetime(
+  lifetimes: Map<string, { kind: ObjectKind; path: string; firstOrdinal: number; lastOrdinal: number }>,
+  kind: ObjectKind,
+  itemPath: string,
+  ordinal: number,
+): void {
+  const key = `${kind}\x00${itemPath}`;
+  const current = lifetimes.get(key);
+  if (!current) lifetimes.set(key, { kind, path: itemPath, firstOrdinal: ordinal, lastOrdinal: ordinal });
+  else current.lastOrdinal = ordinal;
+}
+
 function rollUpDirectories(repositoryId: number, commitSha: string, changes: FileChange[]): DirMetric[] {
   const byDir = new Map<string, { added: number; removed: number }>();
   for (const change of changes) {
@@ -185,6 +197,7 @@ export async function analyzeRepository(repositoryId: number, repoPath: string, 
     const commits: CommitRecord[] = [];
     const changes: FileChange[] = [];
     const dirMetrics: DirMetric[] = [];
+    const lifetimes = new Map<string, { kind: ObjectKind; path: string; firstOrdinal: number; lastOrdinal: number }>();
 
     transaction(db, () => {
       for (const parsed of parsedCommits) {
@@ -217,6 +230,10 @@ export async function analyzeRepository(repositoryId: number, repoPath: string, 
         added: change.added,
         removed: change.removed,
       }));
+      for (const change of commitChanges) {
+        touchLifetime(lifetimes, "file", change.path, ordinal);
+        for (const dir of ancestorDirectories(change.path)) touchLifetime(lifetimes, "dir", dir, ordinal);
+      }
       changes.push(...commitChanges);
       dirMetrics.push(...rollUpDirectories(repositoryId, parsed.sha, commitChanges));
 
@@ -227,9 +244,17 @@ export async function analyzeRepository(repositoryId: number, repoPath: string, 
       }
     }
 
+    const objectLifetimes: ObjectLifetime[] = [...lifetimes.values()].map((item) => ({
+      repositoryId,
+      kind: item.kind,
+      path: item.path,
+      firstOrdinal: item.firstOrdinal,
+      lastOrdinal: item.lastOrdinal,
+    }));
+
     await onProgress?.("indexing", 85, "Persisting metric indexes");
     await updateRepositoryProgress(repositoryId, "indexing", "indexing", 85);
-    await replaceRepositoryAnalysis({ repositoryId, commits, changes, dirMetrics });
+    await replaceRepositoryAnalysis({ repositoryId, commits, changes, dirMetrics, objectLifetimes });
     await onProgress?.("done", 100, "Analysis complete");
   } catch (error) {
     await updateRepositoryStatus(repositoryId, "failed", error instanceof Error ? error.message : String(error));
